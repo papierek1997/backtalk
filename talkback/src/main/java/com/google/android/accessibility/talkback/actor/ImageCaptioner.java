@@ -75,6 +75,7 @@ import android.graphics.Bitmap;
 import android.graphics.Bitmap.Config;
 import android.graphics.Color;
 import android.graphics.Rect;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
@@ -161,9 +162,14 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
 /** Performs image caption and manages related state. */
 public class ImageCaptioner extends Handler
@@ -229,6 +235,14 @@ public class ImageCaptioner extends Handler
 
   /** A handler for showing UI elements, like a dialog. */
   private final Handler mainHandler;
+  private final ExecutorService captionPreparationWorker = Executors.newSingleThreadExecutor(
+      runnable -> new Thread(() -> {
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+        runnable.run();
+      }, "BackTalk-caption-preparation"));
+  private Executor captionPreparationExecutor = captionPreparationWorker;
+  private volatile int captionPreparationGeneration;
+  private volatile @Nullable AccessibilityNodeInfoCompat latestCaptionFocus;
 
   /**
    * The unique ID for caption requests. The ID of different caption requests for a node are the
@@ -691,6 +705,8 @@ public class ImageCaptioner extends Handler
   public void shutdown() {
     // Ends all requests, so that results that come later are ignored.
     clearRequests();
+    // Drain cancelled jobs so that each one releases its captured bitmap.
+    captionPreparationWorker.shutdown();
     shutdownIconDetector();
     shutdownImageDescription();
     moduleStateManager.shutdown();
@@ -767,6 +783,8 @@ public class ImageCaptioner extends Handler
   @Override
   public void newItemFocused(
       AccessibilityNodeInfo nodeInfo, Interpretation.AccessibilityFocused axFocused) {
+    latestCaptionFocus = nodeInfo == null ? null
+        : AccessibilityNodeInfoCompat.wrap(AccessibilityNodeInfo.obtain(nodeInfo));
     @Nullable CaptionResult currentCaption = captionResults.getCaptionResult(requestId);
     if (currentCaption == null || currentCaption.isFinished()) {
       return;
@@ -877,6 +895,9 @@ public class ImageCaptioner extends Handler
    * if it exists in the cache.
    */
   public boolean caption(AccessibilityNodeInfoCompat node, boolean isUserRequested) {
+    if (!isUserRequested && !hasAutomaticCaptionConsumer(node)) {
+      return true;
+    }
     @Nullable ImageNode savedResult = imageCaptionStorage.getCaptionResults(node);
     analytics.onImageCaptionEvent(IMAGE_CAPTION_EVENT_CAPTION_REQUEST);
 
@@ -998,13 +1019,19 @@ public class ImageCaptioner extends Handler
       return;
     }
 
+    prepareCaptionScreens(
+        request, focusedNode, screenCapture, isUserRequested, captureByWindow,
+        screens -> finishImageCaptioningWithGemini(
+            request, focusedNode, isUserRequested, isToAiCore, screens));
+  }
+
+  private void finishImageCaptioningWithGemini(
+      ScreenshotCaptureRequest request,
+      AccessibilityNodeInfoCompat focusedNode,
+      boolean isUserRequested,
+      boolean isToAiCore,
+      ProcessedScreens screens) {
     requestId++;
-    ProcessedScreens screens =
-        processImageForNodeCaption(
-            focusedNode,
-            screenCapture,
-            getTalkBackFocusStrokeWidth(prefs, service.getResources()),
-            captureByWindow);
     CaptionResult captionResult =
         new CaptionResult(
             request,
@@ -1196,6 +1223,15 @@ public class ImageCaptioner extends Handler
   @Nullable
   Bitmap blockOverlaps(
       AccessibilityNodeInfoCompat root, AccessibilityNodeInfoCompat node, Bitmap screenshot) {
+    return blockOverlaps(root, node, screenshot, () -> false, /* metadataOnly= */ false);
+  }
+
+  @VisibleForTesting
+  @Nullable
+  Bitmap blockOverlaps(
+      AccessibilityNodeInfoCompat root, AccessibilityNodeInfoCompat node, Bitmap screenshot,
+      BooleanSupplier isStale, boolean metadataOnly) {
+    throwIfCaptionStale(isStale);
     if (root == null || node == null) {
       LogUtils.w(TAG, "Can't perform blockOverlaps; the caller may need to reuse screenshot");
       return null;
@@ -1206,16 +1242,18 @@ public class ImageCaptioner extends Handler
     selfAndAncestors.add(node);
     AccessibilityNodeInfoCompat parent = node.getParent();
     while (parent != null) {
-      selfAndAncestors.add(parent);
+      throwIfCaptionStale(isStale);
+      if (!selfAndAncestors.add(parent)) {
+        break;
+      }
       parent = parent.getParent();
     }
 
     // Finds focusable and intersected nodes.
     Rect nodeBounds = new Rect();
     node.getBoundsInScreen(nodeBounds);
-    List<AccessibilityNodeInfoCompat> overlaps =
-        AccessibilityNodeInfoUtils.getMatchingDescendantsOrRoot(
-            root,
+    List<AccessibilityNodeInfoCompat> overlaps = new ArrayList<>();
+    collectCaptionOverlaps(root,
             new Filter<AccessibilityNodeInfoCompat>() {
               @Override
               public boolean accept(AccessibilityNodeInfoCompat info) {
@@ -1232,7 +1270,8 @@ public class ImageCaptioner extends Handler
                 }
                 return false;
               }
-            });
+            }, new HashSet<>(), overlaps, isStale, metadataOnly);
+    throwIfCaptionStale(isStale);
 
     boolean isBlockedOut = false;
     int width = screenshot.getWidth();
@@ -1321,6 +1360,12 @@ public class ImageCaptioner extends Handler
       return;
     }
 
+    if (!isUserRequested && !hasAutomaticCaptionConsumer(node)) {
+      recycleBitmap(screenCapture);
+      screenshotRequests.performNextRequest(request);
+      return;
+    }
+
     LogUtils.v(TAG, "onScreenCaptureFinish() taking screenshot is successful.");
 
     // Image captioning with Gemini(auto-triggered).
@@ -1340,14 +1385,17 @@ public class ImageCaptioner extends Handler
       }
     }
 
-    requestId++;
+    prepareCaptionScreens(
+        request, node, screenCapture, isUserRequested, captureByWindow,
+        screens -> finishScreenshotCaption(request, node, isUserRequested, screens));
+  }
 
-    ProcessedScreens screens =
-        processImageForNodeCaption(
-            node,
-            screenCapture,
-            getTalkBackFocusStrokeWidth(prefs, service.getResources()),
-            captureByWindow);
+  private void finishScreenshotCaption(
+      ScreenshotCaptureRequest request,
+      AccessibilityNodeInfoCompat node,
+      boolean isUserRequested,
+      ProcessedScreens screens) {
+    requestId++;
 
     CaptionResult captionResult =
         new CaptionResult(request, AccessibilityNode.takeOwnership(node), isUserRequested);
@@ -1626,6 +1674,16 @@ public class ImageCaptioner extends Handler
         context, prefs, FeatureSwitchDialogResources.TEXT_RECOGNITION, captionNodeType);
   }
 
+  private boolean hasAutomaticCaptionConsumer(AccessibilityNodeInfoCompat node) {
+    CaptionNodeType type = getCaptionNodeType(service, node, /* needSizeCheck= */ false);
+    boolean hasAiCore = actorState.getGeminiState().hasAiCore();
+    return needAutomaticTextRecognition(service, prefs, type)
+        || (iconAnnotationsDetector != null && needAutomaticIconDetection(service, prefs, type))
+        || ((hasAiCore || imageDescriptionProcessor != null)
+            && needAutomaticImageDescription(service, prefs,
+                getCaptionNodeType(service, node, /* needSizeCheck= */ true), hasAiCore));
+  }
+
   private static boolean needAutomaticImageCaptioning(
       Context context,
       SharedPreferences prefs,
@@ -1659,6 +1717,7 @@ public class ImageCaptioner extends Handler
    * later are ignored.
    */
   public void clearRequests() {
+    captionPreparationGeneration++;
     removeMessages(MSG_RESULT_TIMEOUT);
     screenshotRequests.clear();
     characterCaptionRequests.clear();
@@ -2022,16 +2081,143 @@ public class ImageCaptioner extends Handler
     }
   }
 
+  @VisibleForTesting
+  void setCaptionPreparationExecutor(Executor executor) {
+    captionPreparationExecutor = executor;
+  }
+
+  private static void recycleBitmap(@Nullable Bitmap bitmap) {
+    if (bitmap != null && !bitmap.isRecycled()) {
+      bitmap.recycle();
+    }
+  }
+
+  private static void recycleScreens(ProcessedScreens screens) {
+    recycleBitmap(screens.croppedScreenCapture());
+    recycleBitmap(screens.blockedScreenCapture());
+  }
+
+  private boolean returnToMainThread(Runnable result) {
+    if (Looper.myLooper() == mainHandler.getLooper()) {
+      result.run();
+      return true;
+    }
+    return mainHandler.post(result);
+  }
+
+  /** Tree queries and bitmap masking must not block gesture dispatch on the service looper. */
+  private void prepareCaptionScreens(
+      ScreenshotCaptureRequest request,
+      AccessibilityNodeInfoCompat node,
+      Bitmap capture,
+      boolean isUserRequested,
+      boolean captureByWindow,
+      Consumer<ProcessedScreens> onPrepared) {
+    final int generation = captionPreparationGeneration;
+    BooleanSupplier isStale = () -> {
+      AccessibilityNodeInfoCompat focus = latestCaptionFocus;
+      return generation != captionPreparationGeneration
+          || (!isUserRequested && focus != null
+              && (!node.equals(focus)
+                  || !Objects.equals(node.getUniqueId(), focus.getUniqueId())));
+    };
+    final int strokeWidth = getTalkBackFocusStrokeWidth(prefs, service.getResources());
+    try {
+      captionPreparationExecutor.execute(() -> {
+        if (isStale.getAsBoolean()) {
+          recycleBitmap(capture);
+          returnToMainThread(() -> advanceAbandonedPreparation(request, generation));
+          return;
+        }
+        final ProcessedScreens screens;
+        try {
+          screens = processImageForNodeCaption(
+              node, capture, strokeWidth, captureByWindow, isStale, !isUserRequested);
+        } catch (CancellationException abandoned) {
+          recycleBitmap(capture);
+          returnToMainThread(() -> advanceAbandonedPreparation(request, generation));
+          return;
+        } catch (RuntimeException failure) {
+          recycleBitmap(capture);
+          LogUtils.e(TAG, "Caption image preparation failed: %s", failure);
+          returnToMainThread(() -> {
+            if (generation == captionPreparationGeneration) {
+              handleScreenshotCaptureFailure(request, isUserRequested);
+            }
+          });
+          return;
+        }
+        if (!returnToMainThread(() -> {
+          if (isStale.getAsBoolean()) {
+            recycleScreens(screens);
+            advanceAbandonedPreparation(request, generation);
+            return;
+          }
+          onPrepared.accept(screens);
+        })) {
+          recycleScreens(screens);
+        }
+      });
+    } catch (RejectedExecutionException stopped) {
+      recycleBitmap(capture);
+      if (generation == captionPreparationGeneration) {
+        handleScreenshotCaptureFailure(request, isUserRequested);
+      }
+    }
+  }
+
+  private void advanceAbandonedPreparation(ScreenshotCaptureRequest request, int generation) {
+    if (generation == captionPreparationGeneration) {
+      screenshotRequests.performNextRequest(request);
+    }
+  }
+
+  private static void throwIfCaptionStale(BooleanSupplier isStale) {
+    if (isStale.getAsBoolean()) {
+      throw new CancellationException("Automatic caption focus changed");
+    }
+  }
+
+  /** Same inclusive depth-first traversal as getMatchingDescendantsOrRoot, with cancellation. */
+  @VisibleForTesting
+  static void collectCaptionOverlaps(
+      @Nullable AccessibilityNodeInfoCompat node, Filter<AccessibilityNodeInfoCompat> filter,
+      Set<AccessibilityNodeInfoCompat> visited, List<AccessibilityNodeInfoCompat> matches,
+      BooleanSupplier isStale, boolean metadataOnly) {
+    throwIfCaptionStale(isStale);
+    if (node == null || !visited.add(node)) {
+      return;
+    }
+    if (filter.accept(node)) {
+      matches.add(node);
+    }
+    int children = node.getChildCount();
+    for (int i = 0; i < children; i++) {
+      throwIfCaptionStale(isStale);
+      // A stale automatic job must not leave a large descendant prefetch running in the app.
+      AccessibilityNodeInfoCompat child = metadataOnly && Build.VERSION.SDK_INT >= 33
+          ? node.getChild(i, AccessibilityNodeInfoCompat.FLAG_PREFETCH_ANCESTORS
+              | AccessibilityNodeInfoCompat.FLAG_PREFETCH_SIBLINGS) : node.getChild(i);
+      collectCaptionOverlaps(child, filter, visited, matches, isStale, metadataOnly);
+    }
+  }
+
   private ProcessedScreens processImageForNodeCaption(
       AccessibilityNodeInfoCompat node,
       Bitmap screenCapture,
       int focusStrokeWidth,
-      boolean captureByWindow) {
-    @Nullable AccessibilityNodeInfoCompat root = AccessibilityNodeInfoUtils.getRoot(node);
+      boolean captureByWindow,
+      BooleanSupplier isStale,
+      boolean metadataOnly) {
+    throwIfCaptionStale(isStale);
+    AccessibilityWindowInfoCompat window = node.getWindow();
+    @Nullable AccessibilityNodeInfoCompat root =
+        metadataOnly && Build.VERSION.SDK_INT >= 33 && window != null
+            ? window.getRoot(/* prefetchingStrategy= */ 0) : AccessibilityNodeInfoUtils.getRoot(node);
     Bitmap blockedScreenCapture;
 
     long startTime = SystemClock.uptimeMillis();
-    blockedScreenCapture = blockOverlaps(root, node, screenCapture);
+    blockedScreenCapture = blockOverlaps(root, node, screenCapture, isStale, metadataOnly);
     primeLogImageCaptionEvent(
         IMAGE_CAPTION_IMAGE_PROCESS_BLOCK_OVERLAY, SystemClock.uptimeMillis() - startTime);
     if (blockedScreenCapture == null) {
@@ -2042,10 +2228,15 @@ public class ImageCaptioner extends Handler
       }
     }
 
-    Bitmap croppedScreenCapture =
-        cropImageWithNodeBounds(node, blockedScreenCapture, focusStrokeWidth, captureByWindow);
-
-    return ProcessedScreens.create(blockedScreenCapture, croppedScreenCapture);
+    try {
+      throwIfCaptionStale(isStale);
+      Bitmap croppedScreenCapture =
+          cropImageWithNodeBounds(node, blockedScreenCapture, focusStrokeWidth, captureByWindow);
+      return ProcessedScreens.create(blockedScreenCapture, croppedScreenCapture);
+    } catch (RuntimeException failure) {
+      recycleBitmap(blockedScreenCapture);
+      throw failure;
+    }
   }
 
   private void primeLogImageCaptionEvent(TimerAction timerAction, long duration) {

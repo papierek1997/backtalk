@@ -30,6 +30,7 @@ import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import com.google.android.accessibility.talkback.ActorState
 import com.google.android.accessibility.talkback.ActorStateWritable
 import com.google.android.accessibility.talkback.Feedback
+import com.google.android.accessibility.talkback.Interpretation
 import com.google.android.accessibility.talkback.Pipeline
 import com.google.android.accessibility.talkback.PrimesController
 import com.google.android.accessibility.talkback.R
@@ -51,7 +52,12 @@ import com.google.android.accessibility.talkback.imagedescription.ImageDescripti
 import com.google.android.accessibility.utils.FormFactorUtils
 import com.google.android.accessibility.utils.SharedPreferencesUtils
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.function.BooleanSupplier
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -183,6 +189,8 @@ class ImageCaptionerRequestsTest {
       )
     captioner.setPipeline(pipeline)
     captioner.setActorState(actorStateWithoutAiCore())
+    // Existing lifecycle cases explicitly complete each operation on the test thread.
+    captioner.setCaptionPreparationExecutor(Executor { it.run() })
 
     // Robolectric compares nodes by their view.
     val info = AccessibilityNodeInfo(View(context))
@@ -190,6 +198,11 @@ class ImageCaptionerRequestsTest {
     info.className = "android.widget.ImageView"
     info.isVisibleToUser = true
     node = AccessibilityNodeInfoCompat.wrap(info)
+  }
+
+  @After
+  fun tearDown() {
+    captioner.shutdown()
   }
 
   /** A service with a context, which is all that GeminiActor needs of it. */
@@ -237,19 +250,21 @@ class ImageCaptionerRequestsTest {
   }
 
   /** Ends a screenshot request with a picture, as the system callback would. */
-  private fun takeScreenshot(callback: TakeScreenshotCallback) {
+  private fun takeScreenshot(callback: TakeScreenshotCallback): Bitmap {
     val requestField =
       callback.javaClass.declaredFields.first {
         ScreenshotCaptureRequest::class.java.isAssignableFrom(it.type)
       }
     requestField.isAccessible = true
     val request = requestField.get(callback) as ScreenshotCaptureRequest
+    val bitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
     ScreenshotCaptureRequest::class
       .java
       .getDeclaredMethod("onFinished", Bitmap::class.java, Boolean::class.javaPrimitiveType)
       .apply { isAccessible = true }
-      .invoke(request, Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888), false)
+      .invoke(request, bitmap, false)
     idle()
+    return bitmap
   }
 
   private fun failScreenshot(callback: TakeScreenshotCallback) {
@@ -356,12 +371,167 @@ class ImageCaptionerRequestsTest {
       .commit()
     captioner.caption(node, /* isUserRequested= */ false)
     idle()
-    takeScreenshot(service.callbacks[0])
+    assertTrue("Disabled automatic recognition must not capture the screen", service.callbacks.isEmpty())
 
     val request = describeImageWithGemini()
     advance(Duration.ofSeconds(30))
     answer(request, "A cat on a sofa.")
     assertEquals(spoken.toString(), listOf<CharSequence?>("A cat on a sofa."), resultDialogs)
+  }
+
+  @Test
+  fun slowImagePreparationDoesNotBlockTheMainLooper() {
+    val entered = CountDownLatch(1)
+    val release = CountDownLatch(1)
+    var ranOnMain = true
+    captioner.shutdown()
+    // This constructor uses the real, production worker, with no test executor substitution.
+    captioner = object : ImageCaptioner(
+      service, ImageCaptionStorage(), focusMonitor, TalkBackAnalyticsImpl(context), PrimesController()
+    ) {
+      override fun blockOverlaps(
+        root: AccessibilityNodeInfoCompat?, node: AccessibilityNodeInfoCompat?, screenshot: Bitmap,
+        isStale: BooleanSupplier, metadataOnly: Boolean
+      ): Bitmap? {
+        ranOnMain = Looper.myLooper() == Looper.getMainLooper()
+        entered.countDown()
+        check(release.await(3, TimeUnit.SECONDS)) { "Test did not release image preparation" }
+        return null
+      }
+    }
+    captioner.setPipeline(pipeline)
+    captioner.setActorState(actorStateWithoutAiCore())
+    try {
+      captioner.captionWithGemini(node)
+      advance(Duration.ofMillis(500))
+      takeScreenshot(service.callbacks.single())
+      assertTrue("Worker did not start", entered.await(2, TimeUnit.SECONDS))
+      assertTrue("Image preparation ran on the service looper", !ranOnMain)
+      var gestureDispatched = false
+      android.os.Handler(Looper.getMainLooper()).post { gestureDispatched = true }
+      idle()
+      assertTrue("A pending image blocked a main-thread message", gestureDispatched)
+      assertTrue(geminiRequests.isEmpty())
+    } finally {
+      release.countDown()
+    }
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+    while (geminiRequests.isEmpty() && System.nanoTime() < deadline) {
+      Thread.sleep(5)
+      idle()
+    }
+    assertEquals("Completed preparation was not delivered", 1, geminiRequests.size)
+  }
+
+  @Test
+  fun cancelledPreparationRecyclesTheCaptureAndDoesNotFinishANewerScreenshot() {
+    val pending = ArrayDeque<Runnable>()
+    captioner.setCaptionPreparationExecutor(Executor { pending.add(it) })
+    captioner.captionWithGemini(node)
+    idle()
+    val bitmap = takeScreenshot(service.callbacks.single())
+    assertEquals(1, pending.size)
+    captioner.clearRequests()
+    captioner.captionWithGemini(node)
+    idle()
+    assertEquals(2, service.callbacks.size)
+    pending.removeFirst().run()
+    idle()
+    assertTrue("Cancelled capture leaked", bitmap.isRecycled)
+    assertTrue("Cancelled capture reached the model", geminiRequests.isEmpty())
+    captioner.captionWithGemini(node)
+    idle()
+    assertEquals("Old preparation advanced a newer screenshot", 2, service.callbacks.size)
+    failScreenshot(service.callbacks[1])
+    assertEquals(3, service.callbacks.size)
+  }
+
+  @Test
+  fun cancelledPreparedResultDoesNotReachTheModel() {
+    val pending = ArrayDeque<Runnable>()
+    captioner.setCaptionPreparationExecutor(Executor { pending.add(it) })
+    captioner.captionWithGemini(node)
+    idle()
+    val bitmap = takeScreenshot(service.callbacks.single())
+    // Preparation finishes on its worker, but its main-thread delivery is still pending.
+    Thread { pending.removeFirst().run() }.apply { start(); join(2000); assertTrue(!isAlive) }
+    captioner.clearRequests()
+    idle()
+    assertTrue("Stale prepared capture leaked", bitmap.isRecycled)
+    assertTrue("Stale prepared result reached the model", geminiRequests.isEmpty())
+  }
+
+  @Test
+  fun rejectedPreparationRecyclesTheCaptureAndAdvancesTheScreenshotQueue() {
+    captioner.setCaptionPreparationExecutor(Executor { throw RejectedExecutionException("Stopped") })
+    captioner.captionWithGemini(node)
+    captioner.captionWithGemini(node)
+    idle()
+    val bitmap = takeScreenshot(service.callbacks.single())
+    assertTrue("Rejected capture leaked", bitmap.isRecycled)
+    assertTrue(geminiRequests.isEmpty())
+    assertEquals("Rejected preparation left the queue stuck", 2, service.callbacks.size)
+  }
+
+  private fun moveFocusElsewhere() {
+    captioner.newItemFocused(AccessibilityNodeInfo(View(context)).apply {
+      isAccessibilityFocused = true
+      isVisibleToUser = true
+    }, Interpretation.AccessibilityFocused.create(null, false))
+  }
+
+  private fun startAutomaticPreparation(pending: ArrayDeque<Runnable>): Bitmap {
+    SharedPreferencesUtils.getSharedPreferences(context).edit()
+      .putBoolean(context.getString(R.string.pref_auto_text_recognition_key), true).commit()
+    captioner.setCaptionPreparationExecutor(Executor { pending.add(it) })
+    captioner.newItemFocused(node.unwrap(), Interpretation.AccessibilityFocused.create(null, true))
+    captioner.caption(node, /* isUserRequested= */ false)
+    idle()
+    return takeScreenshot(service.callbacks.single())
+  }
+
+  @Test
+  fun staleAutomaticPreparationRecyclesItsCaptureAndLetsAManualRequestStart() {
+    val pending = ArrayDeque<Runnable>()
+    val capture = startAutomaticPreparation(pending)
+    moveFocusElsewhere()
+    pending.removeFirst().run()
+    idle()
+    assertTrue("Old automatic capture leaked", capture.isRecycled)
+    assertTrue("Abandoned OCR announced a failure", spoken.isEmpty())
+    captioner.captionWithGemini(node)
+    idle()
+    assertEquals("A stale automatic request held the screenshot queue", 2, service.callbacks.size)
+  }
+
+  @Test
+  fun automaticPreparationLosingFocusBeforeDeliveryDoesNotStartRecognition() {
+    val pending = ArrayDeque<Runnable>()
+    val capture = startAutomaticPreparation(pending)
+    Thread { pending.removeFirst().run() }.apply { start(); join(2000); assertTrue(!isAlive) }
+    moveFocusElsewhere()
+    idle()
+    assertTrue("Stale automatic result leaked", capture.isRecycled)
+    assertTrue("Stale result reached the model", geminiRequests.isEmpty())
+    assertTrue(spoken.isEmpty())
+    captioner.captionWithGemini(node)
+    idle()
+    assertEquals(2, service.callbacks.size)
+  }
+
+  @Test
+  fun manualPreparationSurvivesAFocusChange() {
+    val pending = ArrayDeque<Runnable>()
+    captioner.setCaptionPreparationExecutor(Executor { pending.add(it) })
+    captioner.captionWithGemini(node)
+    idle()
+    takeScreenshot(service.callbacks.single())
+    moveFocusElsewhere()
+    pending.removeFirst().run()
+    idle()
+    assertEquals("A focus move discarded an explicit description request", 1, geminiRequests.size)
+    answer(geminiRequests.single(), "Requested image")
+    assertEquals(listOf<CharSequence?>("Requested image"), resultDialogs)
   }
 
   @Test
