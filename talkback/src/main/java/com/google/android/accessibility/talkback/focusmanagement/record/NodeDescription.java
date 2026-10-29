@@ -111,9 +111,16 @@ public class NodeDescription {
   }
 
   public NodeDescription(@NonNull AccessibilityNodeInfoCompat node, boolean isPathEnd) {
+    this(node, isPathEnd, /* collectSurroundings= */ true);
+  }
+
+  /** Identity-only web history does not need to enumerate siblings after every cursor move. */
+  NodeDescription(
+      @NonNull AccessibilityNodeInfoCompat node, boolean isPathEnd, boolean collectSurroundings) {
     this.savedNode = AccessibilityNode.takeOwnership(node);
     this.nodeInfoHashCode = node.hashCode();
-    this.text = getText(this.savedNode, isPathEnd);
+    this.text = collectSurroundings ? getText(this.savedNode, isPathEnd)
+        : AccessibilityNodeInfoUtils.getNodeText(node);
     this.className = node.getClassName();
     this.viewIdResourceName = node.getViewIdResourceName();
 
@@ -123,8 +130,9 @@ public class NodeDescription {
     this.columnIndex = itemInfo == null ? UNDEFINED_INDEX : itemInfo.getColumnIndex();
 
     // Get data from node's position within parent-node.
-    @Nullable AccessibilityNode parent = this.savedNode.getParent();
-    this.rawIndexInParent = getRawIndexInParent(this.savedNode, parent);
+    @Nullable AccessibilityNode parent = collectSurroundings ? this.savedNode.getParent() : null;
+    this.rawIndexInParent = collectSurroundings ? getRawIndexInParent(this.savedNode, parent)
+        : UNDEFINED_INDEX;
     if (rawIndexInParent == UNDEFINED_INDEX) {
       this.previousSiblingText = null;
       this.nextSiblingText = null;
