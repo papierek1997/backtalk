@@ -114,7 +114,18 @@ public class FocusActor implements UserInputEventListener {
     focusManagerInternal =
         new FocusManagerInternal(
             service, focusFinder, screenState, history, accessibilityFocusMonitor);
-    webActor = new WebActor(service, this::updateFocusHistory);
+    webActor = new WebActor(service, new WebActor.UpdateFocusHistory() {
+      @Override
+      public void updateHistory(AccessibilityNodeInfoCompat start, FocusActionInfo info) {
+        updateFocusHistory(start, info);
+      }
+
+      @Override
+      public Runnable prepareNavigationHistory(
+          AccessibilityNodeInfoCompat start, FocusActionInfo info) {
+        return focusManagerInternal.prepareWebNavigationHistory(start, info);
+      }
+    });
   }
 
   public void setActorState(ActorStateWritable actorState) {
@@ -143,6 +154,10 @@ public class FocusActor implements UserInputEventListener {
 
   public AccessibilityFocusActionHistory.Reader getHistory() {
     return history.reader;
+  }
+
+  public void setHasQueuedWebNavigationSupplier(java.util.function.BooleanSupplier supplier) {
+    history.setHasQueuedWebNavigationSupplier(supplier);
   }
 
   //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -196,6 +211,7 @@ public class FocusActor implements UserInputEventListener {
     if (node == null || pipeline == null) {
       return false;
     }
+    webActor.cancelPreparedNavigationHistory();
     if (beforeActivationListener != null) {
       beforeActivationListener.accept(node);
     }
@@ -266,6 +282,7 @@ public class FocusActor implements UserInputEventListener {
     if (node == null || pipeline == null) {
       return false;
     }
+    webActor.cancelPreparedNavigationHistory();
     if (beforeActivationListener != null) {
       beforeActivationListener.accept(node);
     }
