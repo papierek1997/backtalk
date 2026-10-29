@@ -123,10 +123,8 @@ import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -1336,8 +1334,7 @@ public class FocusProcessorForLogicalNavigation {
     // assuming that a WebView container is positioned between native elements:
     // - Forward: Native elements -> WebView container -> web elements -> native elements.
     // - Backward: Native elements -> web elements -> WebView container -> native elements.
-    // At a default-navigation boundary, enter each adjacent document at the appropriate edge.
-    // Its descendants are deliberately absent from the native traversal tree.
+    // Keep the existing native/WebView container stop policy at document boundaries.
     if (WebInterfaceUtils.supportsWebActions(pivot)) {
       navigationResult =
           webNavigationAttempted
@@ -1712,12 +1709,9 @@ public class FocusProcessorForLogicalNavigation {
         return navigateToHtmlTargetWithFallBack(
             middlePivot, navigationAction, nodeFilter, traversalStrategy, eventId);
       } else {
-        // A named document remains an announced stop. An unnamed root is only a bridge to its
-        // contents, not an extra empty element that consumes a swipe.
-        return TextUtils.isEmpty(AccessibilityNodeInfoUtils.getNodeText(middlePivot))
-            ? navigateToHtmlTargetWithFallBack(
-                middlePivot, navigationAction, nodeFilter, traversalStrategy, eventId)
-            : NavigationResult.create(middlePivot);
+        // If the default next native element is the WebView container,
+        // returns the WebView container directly.
+        return NavigationResult.create(middlePivot);
       }
     } else {
       return findTargetFromWebElement(
@@ -1755,8 +1749,10 @@ public class FocusProcessorForLogicalNavigation {
         && (Role.getRole(webPivot) == Role.ROLE_WEB_VIEW)
         && (navigationAction.targetType == NavigationTarget.TARGET_DEFAULT)
         && (logicalDirection == TraversalStrategy.SEARCH_FOCUS_BACKWARD)) {
-      return findTargetOutsideWebElement(
-          webPivot, navigationAction, nodeFilter, traversalStrategy, eventId);
+      AccessibilityNodeInfoCompat target =
+          TraversalStrategyUtils.searchFocus(
+              traversalStrategy, webPivot, searchDirection, nodeFilter);
+      return NavigationResult.create(target);
     }
     return navigateToHtmlTargetWithFallBack(
         webPivot, navigationAction, nodeFilter, traversalStrategy, eventId);
@@ -1779,59 +1775,18 @@ public class FocusProcessorForLogicalNavigation {
         webPivot, navigationAction, nodeFilter, traversalStrategy, eventId);
   }
 
-  /** Leaves the web container after a failed HTML action, without sending the action a second time. */
+  /** Leaves the container after a rejected HTML action, without sending it twice. */
   private NavigationResult findTargetOutsideWebElement(
       AccessibilityNodeInfoCompat webPivot,
       NavigationAction navigationAction,
       Filter<AccessibilityNodeInfoCompat> nodeFilter,
       TraversalStrategy traversalStrategy,
       EventId eventId) {
-    // Navigate out of WebView with normal navigation
     AccessibilityNodeInfoCompat webContainer = webPivot;
     if (Role.getRole(webPivot) != Role.ROLE_WEB_VIEW) {
       webContainer = WebInterfaceUtils.ascendToWebView(webPivot);
     }
     if (webContainer == null) {
-      return NavigationResult.create(NavigationResult.Type.EMPTY);
-    }
-    if (navigationAction.actionType == NavigationAction.DIRECTIONAL_NAVIGATION
-        && navigationAction.targetType == NavigationTarget.TARGET_DEFAULT
-        && (navigationAction.originalNavigationGranularity == null
-            || navigationAction.originalNavigationGranularity == CursorGranularity.DEFAULT)
-        && TraversalStrategyUtils.isLogicalDirection(navigationAction.searchDirection)) {
-      boolean backward = navigationAction.searchDirection == SEARCH_FOCUS_BACKWARD;
-      // Include a meaningful document label in both directions; unnamed roots are never stops.
-      if (backward && !webPivot.equals(webContainer)
-          && !TextUtils.isEmpty(AccessibilityNodeInfoUtils.getNodeText(webContainer))) {
-        return NavigationResult.create(webContainer);
-      }
-      Filter<AccessibilityNodeInfoCompat> nativeOrDocument =
-          Filter.node((node) -> Role.getRole(node) == Role.ROLE_WEB_VIEW
-              && WebInterfaceUtils.supportsWebActions(node)).or(nodeFilter);
-      Set<AccessibilityNodeInfoCompat> visited = new HashSet<>();
-      AccessibilityNodeInfoCompat cursor = webContainer;
-      while (visited.add(cursor)) {
-        AccessibilityNodeInfoCompat next = TraversalStrategyUtils.searchFocus(
-            traversalStrategy, cursor, navigationAction.searchDirection, nativeOrDocument);
-        if (next == null || visited.contains(next)) {
-          return NavigationResult.create(NavigationResult.Type.EMPTY);
-        }
-        if (!WebInterfaceUtils.supportsWebActions(next) || Role.getRole(next) != Role.ROLE_WEB_VIEW) {
-          return NavigationResult.create(next);
-        }
-        boolean named = !TextUtils.isEmpty(AccessibilityNodeInfoUtils.getNodeText(next));
-        if (!backward && named) {
-          return NavigationResult.create(next);
-        }
-        if (navigateToHtmlTarget(next, navigationAction, eventId)) {
-          return NavigationResult.create(NavigationResult.Type.WEB_ELEMENT);
-        }
-        if (backward && named) {
-          return NavigationResult.create(next);
-        }
-        // Empty documents are crossed once, without recursion or an empty focus acknowledgement.
-        cursor = next;
-      }
       return NavigationResult.create(NavigationResult.Type.EMPTY);
     }
     AccessibilityNodeInfoCompat target =

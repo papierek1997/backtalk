@@ -21,15 +21,15 @@ import org.robolectric.annotation.Config
 import org.robolectric.util.ReflectionHelpers
 import org.robolectric.util.ReflectionHelpers.ClassParameter.from
 
+/** Preserve master's container stops while optimizing only moves inside web content. */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class WebDocumentBoundaryTest {
   private lateinit var processor: FocusProcessorForLogicalNavigation
   private val attempts = ArrayList<AccessibilityNodeInfoCompat>()
-  private val empty = HashSet<AccessibilityNodeInfoCompat>()
-  private val nativeFilter = Filter.node {it.className == "android.widget.Button"}
+  private val nativeFilter = Filter.node { it.className == "android.widget.Button" }
   private var order = listOf<Node>()
-  private var nextOverride: ((AccessibilityNodeInfoCompat) -> AccessibilityNodeInfoCompat?)? = null
+  private var htmlAccepted = true
   private var nextId = 0
 
   private inner class Node(web: Boolean = false, label: String = "") :
@@ -37,9 +37,14 @@ class WebDocumentBoundaryTest {
     private val identity = ++nextId
     var parentNode: Node? = null
     init {
-      className = if(web) "android.webkit.WebView" else "android.widget.Button"
-      text = label; packageName = "example.web"; isVisibleToUser = true
-      if(web) {addAction(ACTION_NEXT_HTML_ELEMENT); addAction(ACTION_PREVIOUS_HTML_ELEMENT)}
+      className = if (web) "android.webkit.WebView" else "android.widget.Button"
+      text = label
+      packageName = "example.web"
+      isVisibleToUser = true
+      if (web) {
+        addAction(ACTION_NEXT_HTML_ELEMENT)
+        addAction(ACTION_PREVIOUS_HTML_ELEMENT)
+      }
     }
     override fun getParent(): AccessibilityNodeInfoCompat? = parentNode
     override fun equals(other: Any?): Boolean = this === other
@@ -48,12 +53,11 @@ class WebDocumentBoundaryTest {
 
   private val traversal = object : TraversalStrategy {
     override fun findFocus(start: AccessibilityNodeInfoCompat, direction: Int): AccessibilityNodeInfoCompat? {
-      nextOverride?.let {return it(start)}
       val index = order.indexOf(start)
-      return order.getOrNull(index + if(direction == TraversalStrategy.SEARCH_FOCUS_BACKWARD) -1 else 1)
+      return order.getOrNull(index + if (direction == TraversalStrategy.SEARCH_FOCUS_BACKWARD) -1 else 1)
     }
     override fun focusFirst(root: AccessibilityNodeInfoCompat, direction: Int): AccessibilityNodeInfoCompat? =
-      if(direction == TraversalStrategy.SEARCH_FOCUS_BACKWARD) order.lastOrNull() else order.firstOrNull()
+      if (direction == TraversalStrategy.SEARCH_FOCUS_BACKWARD) order.lastOrNull() else order.firstOrNull()
     override fun getSpeakingNodesCache(): MutableMap<AccessibilityNodeInfoCompat, Boolean> = HashMap()
   }
 
@@ -61,99 +65,84 @@ class WebDocumentBoundaryTest {
     val service = Robolectric.buildService(TalkBackService::class.java).get()
     FormFactorUtils.initialize(service)
     processor = FocusProcessorForLogicalNavigation(service, null, null, null, null,
-      Compositor.TextComposer {_,_,_ -> null}, null)
-    processor.setPipeline(Pipeline.FeedbackReturner {feedback ->
-      val node = feedback.failovers()[0].webAction()!!.target()
-      attempts.add(node)
-      !empty.contains(node)
+      Compositor.TextComposer { _, _, _ -> null }, null)
+    processor.setPipeline(Pipeline.FeedbackReturner { feedback ->
+      attempts.add(feedback.failovers()[0].webAction()!!.target())
+      htmlAccepted
     })
   }
 
-  private fun action(backward: Boolean, target: Int) = NavigationAction.Builder()
-    .setAction(NavigationAction.DIRECTIONAL_NAVIGATION).setTarget(target)
-    .setDirection(if(backward) TraversalStrategy.SEARCH_FOCUS_BACKWARD else TraversalStrategy.SEARCH_FOCUS_FORWARD).build()
-
   private fun find(start: Node, backward: Boolean = false, target: Int = NavigationTarget.TARGET_DEFAULT,
-    method: String = "findTargetOutsideWebElement"): Any =
-    ReflectionHelpers.callInstanceMethod(processor, method,
-      from(AccessibilityNodeInfoCompat::class.java, start), from(NavigationAction::class.java, action(backward,target)),
+    method: String = "findTargetFromMiddlePivot"): Any {
+    val action = NavigationAction.Builder()
+      .setAction(NavigationAction.DIRECTIONAL_NAVIGATION).setTarget(target)
+      .setDirection(if (backward) TraversalStrategy.SEARCH_FOCUS_BACKWARD else TraversalStrategy.SEARCH_FOCUS_FORWARD)
+      .build()
+    return ReflectionHelpers.callInstanceMethod(processor, method,
+      from(AccessibilityNodeInfoCompat::class.java, start), from(NavigationAction::class.java, action),
       from(Filter::class.java, nativeFilter), from(TraversalStrategy::class.java, traversal),
       from(Performance.EventId::class.java, Performance.EVENT_ID_UNTRACKED))
-
-  private fun isWeb(result: Any) = ReflectionHelpers.callInstanceMethod<Boolean>(result,"isWebElement")
-  private fun isEmpty(result: Any) = ReflectionHelpers.callInstanceMethod<Boolean>(result,"isEmpty")
-  private fun node(result: Any) = ReflectionHelpers.callInstanceMethod<AccessibilityNodeInfoCompat?>(result,"getNode")
-
-  @Test fun backwardEntersThePreviousDocumentInsteadOfSkippingItsContents() {
-    val head = Node(); val previous = Node(true); val current = Node(true)
-    order = listOf(head,previous,current)
-    assertTrue(isWeb(find(current,backward=true)))
-    assertEquals(listOf(previous),attempts)
   }
 
-  @Test fun forwardEntersTheNextDocumentInsteadOfSkippingItsContents() {
-    val current = Node(true); val next = Node(true); val tail = Node()
-    order = listOf(current,next,tail)
-    assertTrue(isWeb(find(current)))
-    assertEquals(listOf(next),attempts)
-  }
+  private fun isWeb(result: Any) = ReflectionHelpers.callInstanceMethod<Boolean>(result, "isWebElement")
+  private fun node(result: Any) = ReflectionHelpers.callInstanceMethod<AccessibilityNodeInfoCompat?>(result, "getNode")
 
-  @Test fun emptyDocumentsAreCrossedOnceUntilARealDocumentAcceptsTheMove() {
-    val current = Node(true); val a = Node(true); val b = Node(true); val next = Node(true)
-    order = listOf(current,a,b,next,Node()); empty.addAll(listOf(a,b))
-    assertTrue(isWeb(find(current)))
-    assertEquals(listOf(a,b,next),attempts)
-  }
-
-  @Test fun emptyDocumentsFallBackToTheFollowingNativeControl() {
-    val current = Node(true); val blank = Node(true); val tail = Node()
-    order = listOf(current,blank,tail); empty.add(blank)
-    assertSame(tail,node(find(current)))
-    assertEquals(listOf(blank),attempts)
-  }
-
-  @Test fun aLoopInProviderOrderCannotRepeatTheSameDocumentForever() {
-    val current = Node(true); val blank = Node(true); empty.add(blank)
-    nextOverride = {if(it === current) blank else current}
-    assertTrue(isEmpty(find(current)))
-    assertEquals(listOf(blank),attempts)
-  }
-
-  @Test fun nativeControlsBetweenDocumentsRemainStops() {
-    val current = Node(true); val native = Node(); order = listOf(current,native,Node(true))
-    assertSame(native,node(find(current)))
+  @Test fun forwardEntryStillStopsOnAnUnnamedContainer() {
+    val doc = Node(true)
+    assertSame(doc, node(find(doc)))
     assertTrue(attempts.isEmpty())
   }
 
-  @Test fun macroNavigationKeepsItsExistingFilter() {
-    val current = Node(true); val tail = Node(); order = listOf(current,Node(true),tail)
-    assertSame(tail,node(find(current,target=NavigationTarget.TARGET_HEADING)))
+  @Test fun forwardEntryStillStopsOnANamedContainer() {
+    val doc = Node(true, "Article title")
+    assertSame(doc, node(find(doc)))
     assertTrue(attempts.isEmpty())
   }
 
-  @Test fun enteringAnUnnamedRootFromNativeNavigationDoesNotConsumeAnEmptyStop() {
-    val doc = Node(true); order = listOf(doc,Node())
-    assertTrue(isWeb(find(doc,method="findTargetFromMiddlePivot")))
-    assertEquals(listOf(doc),attempts)
+  @Test fun backwardEntryUsesHtmlForBothNamedAndUnnamedDocuments() {
+    for (label in listOf("", "Article title")) {
+      val doc = Node(true, label)
+      assertTrue(isWeb(find(doc, backward = true)))
+      assertSame(doc, attempts.last())
+    }
+    assertEquals(2, attempts.size)
   }
 
-  @Test fun namedDocumentRootsKeepTheirReadableLabel() {
-    val doc = Node(true,"Article title"); order = listOf(doc,Node())
-    assertSame(doc,node(find(doc,method="findTargetFromMiddlePivot")))
+  @Test fun backwardExitDoesNotIntroduceAnExtraTitleStop() {
+    val head = Node()
+    val doc = Node(true, "Article title")
+    val leaf = Node().apply {
+      parentNode = doc
+      addAction(AccessibilityNodeInfoCompat.ACTION_PREVIOUS_HTML_ELEMENT)
+    }
+    order = listOf(head, doc)
+    assertSame(head, node(find(leaf, backward = true, method = "findTargetOutsideWebElement")))
     assertTrue(attempts.isEmpty())
   }
 
-  @Test fun backwardLeavingANamedDocumentIncludesItsTitle() {
-    val doc = Node(true,"Article title"); val leaf = Node().apply {parentNode=doc;addAction(AccessibilityNodeInfoCompat.ACTION_PREVIOUS_HTML_ELEMENT)}
-    order = listOf(Node(),doc)
-    assertSame(doc,node(find(leaf,backward=true)))
+  @Test fun backwardFromTheContainerKeepsNativeTraversal() {
+    val head = Node()
+    val doc = Node(true, "Article title")
+    order = listOf(head, doc)
+    assertSame(head, node(find(doc, backward = true, method = "findTargetFromWebElement")))
     assertTrue(attempts.isEmpty())
   }
 
-  @Test fun longRunsOfEmptyDocumentsUseIteration() {
-    val current = Node(true); val blanks = List(1000){Node(true)}; val tail = Node()
-    order = listOf(current)+blanks+tail; empty.addAll(blanks)
-    assertSame(tail,node(find(current)))
-    assertEquals(1000,attempts.size)
+  @Test fun rejectedBackwardEntryFallsBackAfterOneHtmlAttempt() {
+    val head = Node()
+    val doc = Node(true)
+    order = listOf(head, doc)
+    htmlAccepted = false
+    assertSame(head, node(find(doc, backward = true)))
+    assertEquals(listOf(doc), attempts)
+  }
+
+  @Test fun forwardExitKeepsTheExistingNativeFilter() {
+    val doc = Node(true)
+    val otherDoc = Node(true)
+    val tail = Node()
+    order = listOf(doc, otherDoc, tail)
+    assertSame(tail, node(find(doc, method = "findTargetOutsideWebElement")))
+    assertTrue(attempts.isEmpty())
   }
 }
