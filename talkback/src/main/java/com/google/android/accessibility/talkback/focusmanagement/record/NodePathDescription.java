@@ -34,6 +34,7 @@ import com.google.android.accessibility.utils.FocusFinder;
 import com.google.android.accessibility.utils.LogDepth;
 import com.google.android.accessibility.utils.Role;
 import com.google.android.accessibility.utils.StringBuilderUtils;
+import com.google.android.accessibility.utils.WebInterfaceUtils;
 import com.google.android.accessibility.utils.compat.CompatUtils;
 import com.google.android.accessibility.utils.traversal.TraversalStrategy;
 import com.google.android.accessibility.utils.traversal.TraversalStrategyUtils;
@@ -57,6 +58,8 @@ public final class NodePathDescription {
 
   // Node and ancestors, ordered from leaf to root
   private final ArrayList<NodeDescription> nodeDescriptions;
+  private @Nullable AccessibilityNodeInfoCompat webDocument;
+  private @Nullable String webDocumentUniqueId;
 
   ////////////////////////////////////////////////////////////////////////////////////////////////
   // Construction methods
@@ -70,9 +73,16 @@ public final class NodePathDescription {
     for (@NonNull NodeDescription n : original.nodeDescriptions) {
       this.nodeDescriptions.add(new NodeDescription(n));
     }
+    this.webDocument = original.webDocument;
+    this.webDocumentUniqueId = original.webDocumentUniqueId;
   }
 
   public static @NonNull NodePathDescription obtain(AccessibilityNodeInfoCompat node) {
+    return obtain(node, WebInterfaceUtils.supportsWebActions(node) && node.getUniqueId() != null);
+  }
+
+  private static @NonNull NodePathDescription obtain(
+      AccessibilityNodeInfoCompat node, boolean useWebIdentity) {
     final NodePathDescription nodePath = new NodePathDescription();
 
     AccessibilityNodeInfoUtils.getSelfOrMatchingAncestor(
@@ -81,12 +91,36 @@ public final class NodePathDescription {
           @Override
           public boolean accept(AccessibilityNodeInfoCompat node) {
             boolean isPathEnd = (nodePath.nodeDescriptions.isEmpty());
-            nodePath.nodeDescriptions.add(new NodeDescription(node, isPathEnd));
+            nodePath.nodeDescriptions.add(new NodeDescription(node, isPathEnd, !useWebIdentity));
+            if (useWebIdentity && nodePath.webDocument == null
+                && Role.getRole(node) == Role.ROLE_WEB_VIEW
+                && WebInterfaceUtils.supportsWebActions(node)) {
+              nodePath.webDocument = node;
+              nodePath.webDocumentUniqueId = node.getUniqueId();
+            }
             // Always return false to iterate until the root node.
             return false;
           }
         });
-    return nodePath;
+    // Other providers may expose HTML actions without a WebView document boundary. Keep their
+    // structural restoration, as well as that of web nodes without stable IDs, unchanged.
+    return useWebIdentity && nodePath.webDocument == null ? obtain(node, false) : nodePath;
+  }
+
+  boolean usesWebIdentity() {
+    return webDocument != null;
+  }
+
+  /** A removed sheet/document cannot contain its old focus in another retained WebView. */
+  @Nullable AccessibilityNodeInfoCompat getCurrentWebDocument() {
+    if (webDocument == null || !webDocument.refresh()
+        || Role.getRole(webDocument) != Role.ROLE_WEB_VIEW
+        || !WebInterfaceUtils.supportsWebActions(webDocument)
+        || (webDocumentUniqueId != null
+            && !webDocumentUniqueId.equals(webDocument.getUniqueId()))) {
+      return null;
+    }
+    return webDocument;
   }
 
   ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -95,6 +129,13 @@ public final class NodePathDescription {
   /** Finds node matching identity-path, or next node after, in traversal order. */
   public @Nullable AccessibilityNodeInfoCompat findNodeToRefocus(
       @Nullable AccessibilityNodeInfoCompat rootCompat, @NonNull FocusFinder focusFinder) {
+
+    // Web identity restoration is handled by FocusActionRecord in the original document. The
+    // ancestor identities are still kept for manual scrolling; native index heuristics cannot
+    // safely choose a replacement in another retained document.
+    if (usesWebIdentity()) {
+      return null;
+    }
 
     @Nullable AccessibilityNodeInfoCompat lastFocusedNode = null;
     if (!nodeDescriptions.isEmpty() && nodeDescriptions.get(0).savedNode != null) {
