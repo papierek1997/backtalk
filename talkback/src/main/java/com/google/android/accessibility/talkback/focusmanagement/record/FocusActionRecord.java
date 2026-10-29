@@ -152,22 +152,24 @@ public class FocusActionRecord {
       @NonNull FocusFinder focusFinder,
       @NonNull FocusActionRecord focusActionRecord) {
     AccessibilityNodeInfoCompat lastFocusedNode = focusActionRecord.getFocusedNode();
+    NodePathDescription savedPath = focusActionRecord.nodePathDescription;
+    if (savedPath.usesWebIdentity()) {
+      root = savedPath.getCurrentWebDocument();
+      if (root == null) {
+        return null;
+      }
+    }
 
     // 1. Unique id match
     @Nullable String uniqueId = focusActionRecord.getUniqueId();
     if (uniqueId != null) {
       AccessibilityNodeInfoCompat uniqueIdNode = null;
       if (lastFocusedNode.refresh()
+          && savedPath.isInWebDocument(lastFocusedNode)
           && uniqueId.equals(compoundPackageNameAndUniqueId(lastFocusedNode))) {
         uniqueIdNode = lastFocusedNode;
       } else {
         AccessibilityNodeInfoCompat searchRoot = root;
-        if (focusActionRecord.nodePathDescription.usesWebIdentity()) {
-          searchRoot = focusActionRecord.nodePathDescription.getCurrentWebDocument();
-          if (searchRoot == null) {
-            return null;
-          }
-        }
         uniqueIdNode =
             AccessibilityNodeInfoUtils.searchFromBfs(
                 searchRoot,
@@ -182,13 +184,11 @@ public class FocusActionRecord {
         LogUtils.d(TAG, "getFocusableNodeFromFocusRecord from uniqueId=%s", uniqueId);
         return uniqueIdNode;
       }
-      if (focusActionRecord.nodePathDescription.usesWebIdentity()) {
-        return null;
-      }
     }
     // 2. Focused node match. Don't use cached node if it's in collection because collection reuse
     // views.
     if (lastFocusedNode.refresh()
+        && savedPath.isInWebDocument(lastFocusedNode)
         && AccessibilityNodeInfoUtils.shouldFocusNode(lastFocusedNode)
         && !AccessibilityNodeInfoUtils.isInCollection(lastFocusedNode)) {
       LogUtils.d(

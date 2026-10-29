@@ -78,11 +78,8 @@ public final class NodePathDescription {
   }
 
   public static @NonNull NodePathDescription obtain(AccessibilityNodeInfoCompat node) {
-    return obtain(node, WebInterfaceUtils.supportsWebActions(node) && node.getUniqueId() != null);
-  }
-
-  private static @NonNull NodePathDescription obtain(
-      AccessibilityNodeInfoCompat node, boolean useWebIdentity) {
+    final boolean useWebIdentity =
+        WebInterfaceUtils.supportsWebActions(node) && node.getUniqueId() != null;
     final NodePathDescription nodePath = new NodePathDescription();
 
     AccessibilityNodeInfoUtils.getSelfOrMatchingAncestor(
@@ -91,7 +88,7 @@ public final class NodePathDescription {
           @Override
           public boolean accept(AccessibilityNodeInfoCompat node) {
             boolean isPathEnd = (nodePath.nodeDescriptions.isEmpty());
-            nodePath.nodeDescriptions.add(new NodeDescription(node, isPathEnd, !useWebIdentity));
+            nodePath.nodeDescriptions.add(new NodeDescription(node, isPathEnd));
             if (useWebIdentity && nodePath.webDocument == null
                 && Role.getRole(node) == Role.ROLE_WEB_VIEW
                 && WebInterfaceUtils.supportsWebActions(node)) {
@@ -102,9 +99,7 @@ public final class NodePathDescription {
             return false;
           }
         });
-    // Other providers may expose HTML actions without a WebView document boundary. Keep their
-    // structural restoration, as well as that of web nodes without stable IDs, unchanged.
-    return useWebIdentity && nodePath.webDocument == null ? obtain(node, false) : nodePath;
+    return nodePath;
   }
 
   boolean usesWebIdentity() {
@@ -123,6 +118,25 @@ public final class NodePathDescription {
     return webDocument;
   }
 
+  /** Checks the current ancestry, including after a provider has moved a still-live node. */
+  boolean isInWebDocument(AccessibilityNodeInfoCompat node) {
+    return webDocument == null
+        || AccessibilityNodeInfoUtils.getSelfOrMatchingAncestor(
+                node, Filter.node(ancestor -> ancestor.equals(webDocument))) != null;
+  }
+
+  private int restorationAncestorLimit() {
+    if (webDocument != null) {
+      for (int p = 0; p < nodeDescriptions.size(); ++p) {
+        if (nodeDescriptions.get(p).savedNode != null
+            && nodeDescriptions.get(p).savedNode.equalTo(webDocument)) {
+          return p;
+        }
+      }
+    }
+    return nodeDescriptions.size() - 1;
+  }
+
   ////////////////////////////////////////////////////////////////////////////////////////////////
   // Methods for finding a node matching an old tree-path
 
@@ -130,11 +144,14 @@ public final class NodePathDescription {
   public @Nullable AccessibilityNodeInfoCompat findNodeToRefocus(
       @Nullable AccessibilityNodeInfoCompat rootCompat, @NonNull FocusFinder focusFinder) {
 
-    // Web identity restoration is handled by FocusActionRecord in the original document. The
-    // ancestor identities are still kept for manual scrolling; native index heuristics cannot
-    // safely choose a replacement in another retained document.
+    // Keep structural recovery when child IDs change, but never search outside the saved document.
+    // Retain the complete path: the scorer uses absolute tree depths and scroll recovery needs
+    // the native ancestors as well.
     if (usesWebIdentity()) {
-      return null;
+      rootCompat = getCurrentWebDocument();
+      if (rootCompat == null) {
+        return null;
+      }
     }
 
     @Nullable AccessibilityNodeInfoCompat lastFocusedNode = null;
@@ -152,6 +169,7 @@ public final class NodePathDescription {
     @Nullable AccessibilityNode targetUp = matchAncestorUniqueId();
     if (targetUp != null && lastFocusedNode != null) {
       if (lastFocusedNode.refresh()
+          && isInWebDocument(lastFocusedNode)
           && AccessibilityNodeInfoUtils.shouldFocusNode(lastFocusedNode)) {
         return lastFocusedNode;
       }
@@ -166,7 +184,7 @@ public final class NodePathDescription {
 
     log("findNodeToRefocus() targetUp=%s", targetUp);
     // Ensure targetUp is not null.
-    if (targetUp == null) {
+    if (targetUp == null || !isInWebDocument(targetUp.getCompat())) {
       targetUp = root;
     }
     // Search down from root or old-ancestor-node, finding lowest new-node that matches the
@@ -174,11 +192,13 @@ public final class NodePathDescription {
     @Nullable AccessibilityNode targetDown = findDownward(rootCompat, focusFinder, targetUp);
     log("findNodeToRefocus() targetDown=%s", targetDown);
 
-    return (targetDown == null) ? targetUp.obtainCopyCompat() : targetDown.obtainCopyCompat();
+    AccessibilityNodeInfoCompat result =
+        (targetDown == null) ? targetUp.obtainCopyCompat() : targetDown.obtainCopyCompat();
+    return isInWebDocument(result) ? result : null;
   }
 
   private @Nullable AccessibilityNode matchAncestorUniqueId() {
-    for (int p = 1; p < nodeDescriptions.size() - 1; ++p) {
+    for (int p = 1; p < restorationAncestorLimit(); ++p) {
       NodeDescription pathParent = nodeDescriptions.get(p); // Parent of pathNode
       @Nullable AccessibilityNode lastParentNode =
           pathParent.savedNode == null
@@ -198,7 +218,7 @@ public final class NodePathDescription {
   /** Searches ancestors for a path-node that still exists, mostly unchanged. */
   private @Nullable AccessibilityNode findUpward() {
     // For each path-node, from leaf to root...
-    for (int p = 0; p < nodeDescriptions.size() - 1; ++p) {
+    for (int p = 0; p < restorationAncestorLimit(); ++p) {
       NodeDescription pathNode = nodeDescriptions.get(p);
       NodeDescription pathParent = nodeDescriptions.get(p + 1); // Parent of pathNode
       boolean isPathEnd = (p == 0);
