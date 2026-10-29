@@ -126,8 +126,10 @@ import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -438,10 +440,10 @@ public class FocusProcessorForLogicalNavigation {
             /* requireEditable= */ false,
             /* isCurrent= */ Filter.node(TraversalTreeCache::holds));
 
-    // The focus monitor can return Android's cached copy of a node that was just removed, so check
-    // with the app that the pivot is still there. Skip that round trip when the saved reading order
-    // holds the pivot: nothing that could remove a node has happened since it was saved.
-    if (pivot != null && !TraversalTreeCache.holds(pivot) && !pivot.refresh()) {
+    // FocusFinder already validates accessibility focus unless the traversal cache holds it.
+    // Validate the input-focus fallback here; do not repeat the same remote refresh for a11y focus.
+    if (pivot != null && !pivot.isAccessibilityFocused()
+        && !TraversalTreeCache.holds(pivot) && !pivot.refresh()) {
       pivot = null;
     }
 
@@ -1260,7 +1262,39 @@ public class FocusProcessorForLogicalNavigation {
       boolean ignoreDescendantsOfPivot,
       NavigationAction navigationAction,
       EventId eventId) {
+    return navigateToDefaultOrMacroGranularityTarget(
+        pivot, ignoreDescendantsOfPivot, navigationAction, eventId, false);
+  }
+
+  private boolean navigateToDefaultOrMacroGranularityTarget(
+      @NonNull AccessibilityNodeInfoCompat pivot,
+      boolean ignoreDescendantsOfPivot,
+      NavigationAction navigationAction,
+      EventId eventId,
+      boolean webNavigationAttempted) {
     int searchDirection = navigationAction.searchDirection;
+
+    // A web action chooses its own next item. The native order excludes the document's children,
+    // so a pivot inside it cannot reuse that order and would rebuild it on every swipe. Ask the
+    // document first, and read the native window only if the action needs to leave the document.
+    // Keep container entry/exit, spatial navigation and leaving micro granularity on their old path.
+    if (!webNavigationAttempted
+        && !ignoreDescendantsOfPivot
+        && navigationAction.actionType == NavigationAction.DIRECTIONAL_NAVIGATION
+        && navigationAction.targetType == NavigationTarget.TARGET_DEFAULT
+        && (navigationAction.originalNavigationGranularity == null
+            || navigationAction.originalNavigationGranularity == CursorGranularity.DEFAULT)
+        && TraversalStrategyUtils.isLogicalDirection(searchDirection)
+        && WebInterfaceUtils.supportsWebActions(pivot)
+        && Role.getRole(pivot) != Role.ROLE_WEB_VIEW) {
+      TraversalTreeCache.rememberPivot(pivot);
+      webNavigationAttempted = true;
+      if (navigateToHtmlTarget(pivot, navigationAction, eventId)) {
+        reachEdge = false;
+        return true;
+      }
+    }
+
     int logicalDirection =
         TraversalStrategyUtils.getLogicalDirection(
             searchDirection, WindowUtils.isScreenLayoutRTL(service));
@@ -1323,7 +1357,7 @@ public class FocusProcessorForLogicalNavigation {
         revealingOffscreen = true;
         try {
           return navigateToDefaultOrMacroGranularityTarget(
-              pivot, ignoreDescendantsOfPivot, navigationAction, eventId);
+              pivot, ignoreDescendantsOfPivot, navigationAction, eventId, webNavigationAttempted);
         } finally {
           revealingOffscreen = false;
         }
@@ -1368,11 +1402,15 @@ public class FocusProcessorForLogicalNavigation {
     // assuming that a WebView container is positioned between native elements:
     // - Forward: Native elements -> WebView container -> web elements -> native elements.
     // - Backward: Native elements -> web elements -> WebView container -> native elements.
-    // Note: the design assumes there is only one WebView and multiple WebView should be a corner
-    // case which is out of the scope.
+    // At a default-navigation boundary, enter each adjacent document at the appropriate edge.
+    // Its descendants are deliberately absent from the native traversal tree.
     if (WebInterfaceUtils.supportsWebActions(pivot)) {
       navigationResult =
-          findTargetFromWebElement(pivot, navigationAction, nodeFilter, traversalStrategy, eventId);
+          webNavigationAttempted
+              ? findTargetOutsideWebElement(
+                  pivot, navigationAction, nodeFilter, traversalStrategy, eventId)
+              : findTargetFromWebElement(
+                  pivot, navigationAction, nodeFilter, traversalStrategy, eventId);
     } else if (navigationAction.targetType == TARGET_CONTAINER) {
       navigationResult = NavigationResult.create(findContainerTarget(pivot, navigationAction));
     } else {
@@ -1511,7 +1549,7 @@ public class FocusProcessorForLogicalNavigation {
           // again with a new tree.
           TraversalTreeCache.clear("focus failed");
           return navigateToDefaultOrMacroGranularityTarget(
-              pivot, ignoreDescendantsOfPivot, navigationAction, eventId);
+              pivot, ignoreDescendantsOfPivot, navigationAction, eventId, webNavigationAttempted);
         }
         return focused;
       }
@@ -1740,9 +1778,12 @@ public class FocusProcessorForLogicalNavigation {
         return navigateToHtmlTargetWithFallBack(
             middlePivot, navigationAction, nodeFilter, traversalStrategy, eventId);
       } else {
-        // If the default next native element is the WebView container,
-        // returns the WebView container directly.
-        return NavigationResult.create(middlePivot);
+        // A named document remains an announced stop. An unnamed root is only a bridge to its
+        // contents, not an extra empty element that consumes a swipe.
+        return TextUtils.isEmpty(AccessibilityNodeInfoUtils.getNodeText(middlePivot))
+            ? navigateToHtmlTargetWithFallBack(
+                middlePivot, navigationAction, nodeFilter, traversalStrategy, eventId)
+            : NavigationResult.create(middlePivot);
       }
     } else {
       return findTargetFromWebElement(
@@ -1780,10 +1821,8 @@ public class FocusProcessorForLogicalNavigation {
         && (Role.getRole(webPivot) == Role.ROLE_WEB_VIEW)
         && (navigationAction.targetType == NavigationTarget.TARGET_DEFAULT)
         && (logicalDirection == TraversalStrategy.SEARCH_FOCUS_BACKWARD)) {
-      AccessibilityNodeInfoCompat target =
-          TraversalStrategyUtils.searchFocus(
-              traversalStrategy, webPivot, searchDirection, nodeFilter);
-      return NavigationResult.create(target);
+      return findTargetOutsideWebElement(
+          webPivot, navigationAction, nodeFilter, traversalStrategy, eventId);
     }
     return navigateToHtmlTargetWithFallBack(
         webPivot, navigationAction, nodeFilter, traversalStrategy, eventId);
@@ -1802,10 +1841,64 @@ public class FocusProcessorForLogicalNavigation {
     if (navigateToHtmlTarget(webPivot, navigationAction, eventId)) {
       return NavigationResult.create(NavigationResult.Type.WEB_ELEMENT);
     }
+    return findTargetOutsideWebElement(
+        webPivot, navigationAction, nodeFilter, traversalStrategy, eventId);
+  }
+
+  /** Leaves the web container after a failed HTML action, without sending the action a second time. */
+  private NavigationResult findTargetOutsideWebElement(
+      AccessibilityNodeInfoCompat webPivot,
+      NavigationAction navigationAction,
+      Filter<AccessibilityNodeInfoCompat> nodeFilter,
+      TraversalStrategy traversalStrategy,
+      EventId eventId) {
     // Navigate out of WebView with normal navigation
     AccessibilityNodeInfoCompat webContainer = webPivot;
     if (Role.getRole(webPivot) != Role.ROLE_WEB_VIEW) {
       webContainer = WebInterfaceUtils.ascendToWebView(webPivot);
+    }
+    if (webContainer == null) {
+      return NavigationResult.create(NavigationResult.Type.EMPTY);
+    }
+    if (navigationAction.actionType == NavigationAction.DIRECTIONAL_NAVIGATION
+        && navigationAction.targetType == NavigationTarget.TARGET_DEFAULT
+        && (navigationAction.originalNavigationGranularity == null
+            || navigationAction.originalNavigationGranularity == CursorGranularity.DEFAULT)
+        && TraversalStrategyUtils.isLogicalDirection(navigationAction.searchDirection)) {
+      boolean backward = navigationAction.searchDirection == SEARCH_FOCUS_BACKWARD;
+      // Include a meaningful document label in both directions; unnamed roots are never stops.
+      if (backward && !webPivot.equals(webContainer)
+          && !TextUtils.isEmpty(AccessibilityNodeInfoUtils.getNodeText(webContainer))) {
+        return NavigationResult.create(webContainer);
+      }
+      Filter<AccessibilityNodeInfoCompat> nativeOrDocument =
+          Filter.node((node) -> Role.getRole(node) == Role.ROLE_WEB_VIEW
+              && WebInterfaceUtils.supportsWebActions(node)).or(nodeFilter);
+      Set<AccessibilityNodeInfoCompat> visited = new HashSet<>();
+      AccessibilityNodeInfoCompat cursor = webContainer;
+      while (visited.add(cursor)) {
+        AccessibilityNodeInfoCompat next = TraversalStrategyUtils.searchFocus(
+            traversalStrategy, cursor, navigationAction.searchDirection, nativeOrDocument);
+        if (next == null || visited.contains(next)) {
+          return NavigationResult.create(NavigationResult.Type.EMPTY);
+        }
+        if (!WebInterfaceUtils.supportsWebActions(next) || Role.getRole(next) != Role.ROLE_WEB_VIEW) {
+          return NavigationResult.create(next);
+        }
+        boolean named = !TextUtils.isEmpty(AccessibilityNodeInfoUtils.getNodeText(next));
+        if (!backward && named) {
+          return NavigationResult.create(next);
+        }
+        if (navigateToHtmlTarget(next, navigationAction, eventId)) {
+          return NavigationResult.create(NavigationResult.Type.WEB_ELEMENT);
+        }
+        if (backward && named) {
+          return NavigationResult.create(next);
+        }
+        // Empty documents are crossed once, without recursion or an empty focus acknowledgement.
+        cursor = next;
+      }
+      return NavigationResult.create(NavigationResult.Type.EMPTY);
     }
     AccessibilityNodeInfoCompat target =
         TraversalStrategyUtils.searchFocus(
