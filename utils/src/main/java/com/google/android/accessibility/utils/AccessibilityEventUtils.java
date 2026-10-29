@@ -76,15 +76,6 @@ public class AccessibilityEventUtils {
       return null;
     }
     try {
-      if (Build.VERSION.SDK_INT >= 33
-          && (event.getEventType() == AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED
-              || event.getEventType() == AccessibilityEvent.TYPE_VIEW_HOVER_ENTER)) {
-        // Cursor movement needs the source and its context first. Fetching all descendants here
-        // can block the next gesture in a large document. Consumers still query children normally
-        // when composing a grouped label; no nodes or events are filtered out.
-        return event.getSource(AccessibilityNodeInfo.FLAG_PREFETCH_ANCESTORS
-            | AccessibilityNodeInfo.FLAG_PREFETCH_SIBLINGS);
-      }
       return event.getSource();
     } catch (IllegalStateException e) {
       return null;
@@ -102,7 +93,7 @@ public class AccessibilityEventUtils {
       return windowId;
     }
     // Try to get window id from event source.
-    AccessibilityNodeInfo source = getSource(event);
+    AccessibilityNodeInfo source = event.getSource();
     return (source == null) ? WINDOW_ID_NONE : source.getWindowId();
   }
 
@@ -111,7 +102,7 @@ public class AccessibilityEventUtils {
     if (!FeatureSupport.supportMultiDisplay()) {
       return Display.DEFAULT_DISPLAY;
     }
-    AccessibilityNodeInfo source = getSource(event);
+    AccessibilityNodeInfo source = event.getSource();
     AccessibilityWindowInfo window = AccessibilityNodeInfoUtils.getWindow(source);
     return (window == null)
         ? Display.DEFAULT_DISPLAY

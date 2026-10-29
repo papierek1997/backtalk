@@ -7,20 +7,15 @@ import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowAccessibilityRecord
 
-/** Robolectric 4.17 stores the test source only in its no-argument getSource() shadow. */
+/** Counts source retrievals without changing the platform's prefetch policy. */
 @Implements(AccessibilityRecord::class)
-class PrefetchingAccessibilityRecordShadow : ShadowAccessibilityRecord() {
-  @JvmField val strategies = mutableListOf<Int?>()
+class ScrollSourceRecordShadow : ShadowAccessibilityRecord() {
+  var sourceReads = 0
+    private set
 
   @Implementation
   protected override fun getSource(): AccessibilityNodeInfo? {
-    strategies.add(null)
-    return super.getSource()
-  }
-
-  @Implementation(minSdk = 33)
-  protected fun getSource(prefetchingStrategy: Int): AccessibilityNodeInfo? {
-    strategies.add(prefetchingStrategy)
+    sourceReads++
     return super.getSource()
   }
 }

@@ -20,7 +20,6 @@ import static android.view.accessibility.AccessibilityEvent.TYPE_VIEW_SCROLLED;
 
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
-import android.os.Build;
 import android.os.Build.VERSION_CODES;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -268,10 +267,9 @@ public class ScrollEventInterpreter implements AccessibilityEventListener {
         }
         // fall through
       case AccessibilityEvent.TYPE_VIEW_SCROLLED:
-        // Only the source's identity and scroll actions are used here. Do not prefetch its
-        // descendants after a scroll has invalidated the framework's subtree cache. Keep this
-        // snapshot local to the callback: the next event must fetch its current source again.
-        AccessibilityNodeInfo sourceNode = getScrollSource(event);
+        // Reuse one source snapshot for this callback. The next event fetches a fresh source
+        // with the platform default prefetch policy.
+        AccessibilityNodeInfo sourceNode = AccessibilityEventUtils.getSource(event);
         ScrollEventInterpretation interpretation = interpret(event, sourceNode);
         if (interpretation == null) {
           return;
@@ -537,14 +535,6 @@ public class ScrollEventInterpreter implements AccessibilityEventListener {
         && audioPlaybackMonitor.isPlaybackSourceActive(
             AudioPlaybackMonitor.PlaybackSource.USAGE_MEDIA)
         && !touchMonitor.isUserTouchingScreen();
-  }
-
-  private static @Nullable AccessibilityNodeInfo getScrollSource(AccessibilityEvent event) {
-    try {
-      return Build.VERSION.SDK_INT >= 33 ? event.getSource(0) : event.getSource();
-    } catch (IllegalStateException e) {
-      return null;
-    }
   }
 
   /** Caches scroll position from {@link AccessibilityEvent}. */
