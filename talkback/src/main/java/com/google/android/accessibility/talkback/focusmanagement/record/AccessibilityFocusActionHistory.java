@@ -36,6 +36,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.Iterator;
+import java.util.function.BooleanSupplier;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -73,7 +74,22 @@ public final class AccessibilityFocusActionHistory {
 
     public @Nullable FocusActionInfo getFocusActionInfoFromEvent(AccessibilityEvent event) {
       FocusActionRecord record = matchFocusActionRecordFromEvent(event);
-      return (record == null) ? null : record.getExtraInfo();
+      if (record == null) {
+        return null;
+      }
+      FocusActionInfo info = record.getExtraInfo();
+      // Another flick may arrive after HTML dispatch or after the first focus reader ran.
+      // Skip expensive speech composition for this intermediate confirmed cursor position,
+      // while every queued move still visits its own node. Do not mutate the saved history.
+      if (!info.forceMuteFeedback
+          && confirmedWebRecord != null
+          && confirmedWebEventTime == event.getEventTime()
+          && confirmedWebRecord.getActionTime() == record.getActionTime()
+          && confirmedWebRecord.getFocusedNode().equals(record.getFocusedNode())
+          && (hasQueuedWebNavigation.getAsBoolean() || pendingWebPivot != null)) {
+        return new FocusActionInfo.Builder(info).setForceMuteFeedback(true).build();
+      }
+      return info;
     }
 
     public FocusActionRecord matchFocusActionRecordFromEvent(AccessibilityEvent event) {
@@ -109,6 +125,11 @@ public final class AccessibilityFocusActionHistory {
 
   /** Restricted-access interface for reading focus state. */
   public final Reader reader = new Reader();
+  private BooleanSupplier hasQueuedWebNavigation = () -> false;
+
+  public void setHasQueuedWebNavigationSupplier(BooleanSupplier supplier) {
+    hasQueuedWebNavigation = supplier;
+  }
 
   //////////////////////////////////////////////////////////////////////////////////////////
   // Constants
@@ -173,6 +194,11 @@ public final class AccessibilityFocusActionHistory {
 
   private boolean focusOnTalkBackUiBeforeWindowTransition = false;
   private long pendingWebFocusActionTime = -1;
+  private @Nullable AccessibilityNodeInfoCompat pendingWebPivot;
+  private long pendingWebToken;
+  private long nextWebToken;
+  private @Nullable FocusActionRecord confirmedWebRecord;
+  private long confirmedWebEventTime = -1;
 
   //////////////////////////////////////////////////////////////////////////////////////////
   // Construction
@@ -199,6 +225,10 @@ public final class AccessibilityFocusActionHistory {
       @NonNull FocusActionInfo extraData,
       long actionTime,
       @Nullable ScreenState currentScreenState) {
+    // A native focus action or exploration supersedes an older prepared web action.
+    if (pendingWebPivot != null) {
+      clearPendingFocusAction();
+    }
     // FocusActionRecord handles making a copy of 'node'. We don't nee to call obtain() here.
     FocusActionRecord record = new FocusActionRecord(node, extraData, actionTime);
 
@@ -239,6 +269,26 @@ public final class AccessibilityFocusActionHistory {
     pendingWebFocusActionInfo = extraData;
     pendingScreenState = currentScreenState;
     pendingWebFocusActionTime = actionTime;
+    pendingWebPivot = null;
+    pendingWebToken = ++nextWebToken;
+  }
+
+  /** Records the command before dispatch; its eventual event supplies the exact new node. */
+  public long prepareWebNavigationHistory(
+      AccessibilityNodeInfoCompat pivot, FocusActionInfo info, long actionTime,
+      @Nullable ScreenState currentScreenState) {
+    onPendingAccessibilityFocusActionOnWebElement(info, actionTime, currentScreenState);
+    pendingWebPivot = AccessibilityNodeInfoCompat.obtain(pivot);
+    return pendingWebToken;
+  }
+
+  /** A rejection must not cancel history already consumed, or a newer command's history. */
+  public boolean cancelPreparedWebNavigationHistory(long token) {
+    if (pendingWebFocusActionInfo == null || pendingWebToken != token) {
+      return false;
+    }
+    clearPendingFocusAction();
+    return true;
   }
 
   public @Nullable FocusActionRecord getLastFocusActionRecordInWindow(
@@ -296,16 +346,36 @@ public final class AccessibilityFocusActionHistory {
         event, AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED)) {
       return null;
     }
-    AccessibilityNodeInfoCompat eventNode = AccessibilityNodeInfoUtils.toCompat(event.getSource());
+    AccessibilityNodeInfoCompat eventNode = AccessibilityEventUtils.sourceCompat(event);
     if (eventNode == null) {
       return null;
+    }
+    // Several pipeline readers ask about the same event. Preserve its confirmed association even
+    // when the provider took longer than the legacy heuristic timeout to finish the action.
+    if (confirmedWebRecord != null && confirmedWebEventTime == event.getEventTime()) {
+      AccessibilityNodeInfoCompat saved = confirmedWebRecord.getFocusedNode();
+      if (eventNode.equals(saved)
+          && TextUtils.equals(eventNode.getText(), saved.getText())
+          && TextUtils.equals(eventNode.getContentDescription(), saved.getContentDescription())
+          && sameCollectionPosition(eventNode, saved)) {
+        return FocusActionRecord.copy(confirmedWebRecord);
+      }
     }
     // We don't use the AccessibilityEvent.getEventTime() here because the potential race condition
     // that the event could be earlier than the actionTime of
     // onPendingAccessibilityFocusActionOnWebElement.
-    long eventTime = SystemClock.uptimeMillis();
+    boolean prepared = pendingWebPivot != null;
+    long eventTime = !prepared
+        ? SystemClock.uptimeMillis() : event.getEventTime();
 
-    tryMatchingPendingFocusAction(eventNode, eventTime);
+    FocusActionRecord confirmed = tryMatchingPendingFocusAction(eventNode, eventTime);
+    if (confirmed != null) {
+      if (prepared) {
+        confirmedWebRecord = confirmed;
+        confirmedWebEventTime = event.getEventTime();
+      }
+      return FocusActionRecord.copy(confirmed);
+    }
 
     FocusActionRecord result = null;
     // Iterate from the newest(last) record to the eldest(first) record.
@@ -330,16 +400,45 @@ public final class AccessibilityFocusActionHistory {
     return result;
   }
 
-  private void tryMatchingPendingFocusAction(
+  private @Nullable FocusActionRecord tryMatchingPendingFocusAction(
       @NonNull AccessibilityNodeInfoCompat focusedNode, long focusEventTime) {
-    if ((pendingWebFocusActionInfo != null)
-        && (focusEventTime - pendingWebFocusActionTime > 0)
-        && WebInterfaceUtils.supportsWebActions(focusedNode)
-        && (focusEventTime - pendingWebFocusActionTime < getTimeoutToleranceMs(focusedNode))) {
-      onAccessibilityFocusAction(
-          focusedNode, pendingWebFocusActionInfo, pendingWebFocusActionTime, pendingScreenState);
-      clearPendingFocusAction();
+    if (pendingWebPivot != null) {
+      if (focusEventTime < pendingWebFocusActionTime) {
+        return null;
+      }
+      if (focusedNode.getWindowId() != pendingWebPivot.getWindowId()
+          || !TextUtils.equals(focusedNode.getPackageName(), pendingWebPivot.getPackageName())) {
+        clearPendingFocusAction();
+        return null;
+      }
+      if (focusedNode.equals(pendingWebPivot)
+          && TextUtils.equals(focusedNode.getText(), pendingWebPivot.getText())
+          && TextUtils.equals(focusedNode.getContentDescription(), pendingWebPivot.getContentDescription())
+          && sameCollectionPosition(focusedNode, pendingWebPivot)) {
+        return null;
+      }
     }
+    if ((pendingWebFocusActionInfo != null)
+        && (focusEventTime - pendingWebFocusActionTime >= 0)
+        && WebInterfaceUtils.supportsWebActions(focusedNode)
+        && (pendingWebPivot != null
+            || focusEventTime - pendingWebFocusActionTime < getTimeoutToleranceMs(focusedNode))) {
+      FocusActionInfo info = pendingWebFocusActionInfo;
+      long actionTime = pendingWebFocusActionTime;
+      ScreenState state = pendingScreenState;
+      clearPendingFocusAction();
+      onAccessibilityFocusAction(focusedNode, info, actionTime, state);
+      return getLastFocusActionRecord();
+    }
+    return null;
+  }
+
+  private static boolean sameCollectionPosition(
+      AccessibilityNodeInfoCompat first, AccessibilityNodeInfoCompat second) {
+    AccessibilityNodeInfoCompat.CollectionItemInfoCompat a = first.getCollectionItemInfo();
+    AccessibilityNodeInfoCompat.CollectionItemInfoCompat b = second.getCollectionItemInfo();
+    return a == null ? b == null : b != null
+        && a.getRowIndex() == b.getRowIndex() && a.getColumnIndex() == b.getColumnIndex();
   }
 
   /**
@@ -368,6 +467,8 @@ public final class AccessibilityFocusActionHistory {
     // Clear editable node focus record.
     lastEditableFocusActionRecord = null;
     cachedNodeToRestoreFocus = null;
+    confirmedWebRecord = null;
+    confirmedWebEventTime = -1;
 
     clearPendingFocusAction();
   }
@@ -375,6 +476,9 @@ public final class AccessibilityFocusActionHistory {
   private void clearPendingFocusAction() {
     pendingWebFocusActionInfo = null;
     pendingWebFocusActionTime = -1;
+    pendingScreenState = null;
+    pendingWebPivot = null;
+    pendingWebToken = 0;
   }
 
   private int getTimeoutToleranceMs(AccessibilityNodeInfoCompat node) {

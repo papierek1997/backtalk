@@ -193,6 +193,19 @@ public class FocusManagerInternal {
     return isAccessibilityFocusActionPerformedSuccessfully;
   }
 
+  Runnable prepareWebNavigationHistory(
+      @NonNull AccessibilityNodeInfoCompat pivot, @NonNull FocusActionInfo info) {
+    boolean wasMuted = muteNextFocus;
+    FocusActionInfo prepared = updateFocusActionInfoIfNecessary(info, null);
+    long token = history.prepareWebNavigationHistory(
+        pivot, prepared, SystemClock.uptimeMillis(), screenState.getStableScreenState());
+    return () -> {
+      if (history.cancelPreparedWebNavigationHistory(token) && wasMuted) {
+        muteNextFocus = true;
+      }
+    };
+  }
+
   void updateFocusHistory(
       @NonNull AccessibilityNodeInfoCompat pivot, @NonNull FocusActionInfo focusActionInfo) {
     // Cache the accessibility focus action history.

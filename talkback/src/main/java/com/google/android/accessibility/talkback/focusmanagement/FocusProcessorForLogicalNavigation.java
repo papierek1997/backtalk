@@ -50,6 +50,7 @@ import android.accessibilityservice.AccessibilityService;
 import android.content.Context;
 import android.graphics.Point;
 import android.graphics.Rect;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -58,6 +59,7 @@ import android.os.Trace;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
+import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import androidx.annotation.IntDef;
@@ -87,6 +89,7 @@ import com.google.android.accessibility.talkback.focusmanagement.record.FocusAct
 import com.google.android.accessibility.talkback.utils.LinkUtils;
 import com.google.android.accessibility.talkback.utils.TalkbackFeatureSupport;
 import com.google.android.accessibility.utils.AccessibilityNode;
+import com.google.android.accessibility.utils.AccessibilityEventUtils;
 import com.google.android.accessibility.utils.AccessibilityNodeInfoUtils;
 import com.google.android.accessibility.utils.AccessibilityServiceCompatUtils;
 import com.google.android.accessibility.utils.AccessibilityWindowInfoUtils;
@@ -199,6 +202,8 @@ public class FocusProcessorForLogicalNavigation {
 
   @NonNull private final TextComposer compositor;
   private final GlobalVariables globalVariables;
+  private final WebNavigationQueue webNavigationQueue =
+      new WebNavigationQueue(new Handler(Looper.getMainLooper()), this::performNavigationAction);
 
   ///////////////////////////////////////////////////////////////////////////////////////////////
   // Construction
@@ -241,6 +246,17 @@ public class FocusProcessorForLogicalNavigation {
       LogUtils.w(TAG, "Cannot perform navigation action: action type undefined.");
       return false;
     }
+    if (isDefaultLogicalNavigation(navigationAction)) {
+      if (webNavigationQueue.enqueueIfWaiting(navigationAction, eventId)) {
+        return true;
+      }
+    } else {
+      webNavigationQueue.clear();
+    }
+    return performNavigationAction(navigationAction, eventId);
+  }
+
+  private boolean performNavigationAction(NavigationAction navigationAction, EventId eventId) {
     AccessibilityNodeInfoCompat pivot = getPivotNodeForNavigationAction(navigationAction);
     if (pivot == null) {
       // Ideally the pivot should never be null. Do the null check in case of exception.
@@ -262,6 +278,48 @@ public class FocusProcessorForLogicalNavigation {
           onScrollOrPageAction(pivot, navigationAction, eventId);
       default -> false;
     };
+  }
+
+  private static boolean isDefaultLogicalNavigation(NavigationAction action) {
+    return action.actionType == NavigationAction.DIRECTIONAL_NAVIGATION
+        && action.targetType == NavigationTarget.TARGET_DEFAULT
+        && (action.originalNavigationGranularity == null
+            || action.originalNavigationGranularity == CursorGranularity.DEFAULT)
+        && TraversalStrategyUtils.isLogicalDirection(action.searchDirection);
+  }
+
+  public void onNavigationAccessibilityEvent(AccessibilityEvent event) {
+    switch (event.getEventType()) {
+      case AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED -> {
+        // Native focus changes need no extra node lookup for the web queue.
+        if (!webNavigationQueue.needsFocusEvent()) {
+          return;
+        }
+        AccessibilityNodeInfoCompat source = AccessibilityEventUtils.sourceCompat(event);
+        if (source != null) {
+          webNavigationQueue.onFocusChanged(source, event.getEventTime());
+        }
+      }
+      case AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_START ->
+          webNavigationQueue.clear();
+      case AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            && (event.getWindowChanges()
+                & AccessibilityEvent.WINDOWS_CHANGE_REMOVED)
+            != 0) {
+          webNavigationQueue.onWindowRemoved(event.getWindowId());
+        }
+      }
+      default -> {}
+    }
+  }
+
+  public void clearPendingWebNavigation() {
+    webNavigationQueue.clear();
+  }
+
+  public boolean hasQueuedWebNavigation() {
+    return webNavigationQueue.hasQueuedCommands();
   }
 
   @VisibleForTesting
@@ -828,7 +886,15 @@ public class FocusProcessorForLogicalNavigation {
    */
   private boolean navigateToHtmlTarget(
       AccessibilityNodeInfoCompat pivot, NavigationAction navigationAction, EventId eventId) {
-    return pipeline.returnFeedback(eventId, Feedback.webDirectionHtml(pivot, navigationAction));
+    long token =
+        isDefaultLogicalNavigation(navigationAction) ? webNavigationQueue.beforeAction(pivot) : 0;
+    boolean accepted = false;
+    try {
+      accepted = pipeline.returnFeedback(eventId, Feedback.webDirectionHtml(pivot, navigationAction));
+      return accepted;
+    } finally {
+      webNavigationQueue.actionReturned(token, accepted);
+    }
   }
 
   /**

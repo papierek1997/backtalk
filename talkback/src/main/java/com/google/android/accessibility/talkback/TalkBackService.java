@@ -2296,6 +2296,13 @@ public class TalkBackService extends AccessibilityServiceCompat
             compositor.getTextComposer());
     directionNavigationActorStateReader = directionNavigationActor.state;
     userInterface.registerListener(directionNavigationActor);
+    addEventListener(directionNavigationActor);
+    serviceStateListeners.add(directionNavigationActor);
+    focuser.getWebActor().setHasQueuedNavigationSupplier(
+        directionNavigationActor::hasQueuedWebNavigation);
+    focuser.setHasQueuedWebNavigationSupplier(directionNavigationActor::hasQueuedWebNavigation);
+    addEventListener(focuser.getWebActor());
+    serviceStateListeners.add(focuser.getWebActor());
     TextEditActor editor =
         new TextEditActor(
             this,

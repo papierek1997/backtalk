@@ -24,6 +24,7 @@ import static com.google.android.accessibility.utils.monitor.InputModeTracker.IN
 import static com.google.android.accessibility.utils.output.SpeechController.QUEUE_MODE_INTERRUPT;
 
 import android.accessibilityservice.AccessibilityService;
+import android.view.accessibility.AccessibilityEvent;
 import androidx.core.view.accessibility.AccessibilityNodeInfoCompat;
 import com.google.android.accessibility.talkback.ActorState;
 import com.google.android.accessibility.talkback.CursorGranularityManager;
@@ -46,6 +47,8 @@ import com.google.android.accessibility.talkback.focusmanagement.action.Navigati
 import com.google.android.accessibility.talkback.focusmanagement.action.NavigationAction.ActionType;
 import com.google.android.accessibility.talkback.focusmanagement.interpreter.ScreenStateMonitor;
 import com.google.android.accessibility.utils.AccessibilityNodeInfoUtils;
+import com.google.android.accessibility.utils.AccessibilityEventListener;
+import com.google.android.accessibility.utils.ServiceStateListener;
 import com.google.android.accessibility.utils.AccessibilityServiceCompatUtils;
 import com.google.android.accessibility.utils.Filter;
 import com.google.android.accessibility.utils.FocusFinder;
@@ -72,7 +75,31 @@ import org.checkerframework.checker.nullness.qual.Nullable;
  * Executes directional navigation actions, such as moving accessibility-focus up/down/left/right,
  * forward/backward, top/bottom.
  */
-public class DirectionNavigationActor implements UserInputEventListener {
+public class DirectionNavigationActor
+    implements UserInputEventListener, AccessibilityEventListener, ServiceStateListener {
+
+  @Override
+  public int getEventTypes() {
+    return AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED
+        | AccessibilityEvent.TYPE_TOUCH_EXPLORATION_GESTURE_START
+        | AccessibilityEvent.TYPE_WINDOWS_CHANGED;
+  }
+
+  @Override
+  public void onAccessibilityEvent(AccessibilityEvent event, EventId eventId) {
+    focusProcessorForLogicalNavigation.onNavigationAccessibilityEvent(event);
+  }
+
+  @Override
+  public void onServiceStateChanged(int newState) {
+    if (newState != SERVICE_STATE_ACTIVE) {
+      focusProcessorForLogicalNavigation.clearPendingWebNavigation();
+    }
+  }
+
+  public boolean hasQueuedWebNavigation() {
+    return focusProcessorForLogicalNavigation.hasQueuedWebNavigation();
+  }
 
   //////////////////////////////////////////////////////////////////////////////////////////////////
   // State reader interface
