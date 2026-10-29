@@ -248,7 +248,7 @@ public class AccessibilityEventProcessor implements DisplayStateChangedListener 
     }
 
     if ((dumpEventMask & event.getEventType()) != 0) {
-      final AccessibilityNodeInfo node = event.getSource();
+      final AccessibilityNodeInfo node = AccessibilityEventUtils.getSource(event);
       LogUtils.v(TAG, DUMP_EVENT_LOG_FORMAT, event, node == null ? "null" : node.hashCode());
     }
 
@@ -430,8 +430,8 @@ public class AccessibilityEventProcessor implements DisplayStateChangedListener 
     if (FormFactorUtils.isAndroidTv()
         && event.getEventType() == AccessibilityEvent.TYPE_VIEW_FOCUSED
         && isPipFocused()
-        && event.getSource() != null
-        && event.getSource().getWindowId()
+        && AccessibilityEventUtils.getSource(event) != null
+        && AccessibilityEventUtils.getSource(event).getWindowId()
             != AccessibilityServiceCompatUtils.getPipWindow(service).getId()) {
       LogUtils.v(
           TAG, "Drop view focused event due to focus being on PIP and event not coming from PIP");
@@ -539,7 +539,7 @@ public class AccessibilityEventProcessor implements DisplayStateChangedListener 
     long time = event.getEventTime();
     boolean sameAsLast =
         signature.equals(lastSelectedSignature) && time - lastSelectedTime < REPEATED_SELECTED_MS;
-    @Nullable AccessibilityNodeInfo source = event.getSource();
+    @Nullable AccessibilityNodeInfo source = AccessibilityEventUtils.getSource(event);
     sameAsLast = sameAsLast && source != null && source.equals(lastSelectedSource);
     lastSelectedSignature = signature;
     lastSelectedSource = source;
@@ -577,7 +577,7 @@ public class AccessibilityEventProcessor implements DisplayStateChangedListener 
     if (event.getEventTime() - lastFocusedEvent.getEventTime() > DELAY_SELECTED_AFTER_FOCUS) {
       return true;
     }
-    AccessibilityNodeInfo selectedSource = event.getSource();
+    AccessibilityNodeInfo selectedSource = AccessibilityEventUtils.getSource(event);
     AccessibilityNodeInfo focusedSource = lastFocusedEvent.getSource();
 
     if (selectedSource != null && focusedSource != null) {
