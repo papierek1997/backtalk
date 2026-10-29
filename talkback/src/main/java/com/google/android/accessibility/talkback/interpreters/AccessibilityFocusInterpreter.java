@@ -46,10 +46,12 @@ import com.google.android.accessibility.talkback.focusmanagement.interpreter.Scr
 import com.google.android.accessibility.talkback.focusmanagement.interpreter.ScreenStateMonitor.ScreenStateChangeListener;
 import com.google.android.accessibility.talkback.focusmanagement.interpreter.TouchExplorationInterpreter.TouchExplorationActionListener;
 import com.google.android.accessibility.talkback.focusmanagement.record.FocusActionInfo;
+import com.google.android.accessibility.talkback.focusmanagement.record.NodePathDescription;
 import com.google.android.accessibility.talkback.interpreters.InputFocusInterpreter.TargetViewChangeListener;
 import com.google.android.accessibility.talkback.interpreters.ManualScrollInterpreter.ManualScrollInterpretation;
 import com.google.android.accessibility.talkback.interpreters.ManualScrollInterpreter.ScrolledViewChangeListener;
 import com.google.android.accessibility.utils.AccessibilityNodeInfoUtils;
+import com.google.android.accessibility.utils.AccessibilityEventUtils;
 import com.google.android.accessibility.utils.DisplayUtils;
 import com.google.android.accessibility.utils.FeatureSupport;
 import com.google.android.accessibility.utils.FormFactorUtils;
@@ -199,6 +201,16 @@ public class AccessibilityFocusInterpreter
     AccessibilityNodeInfoCompat currentA11yFocusedNode =
         accessibilityFocusMonitor.getAccessibilityFocus(/* useInputFocusIfEmpty= */ false);
     if (shouldMoveFocus(currentA11yFocusedNode, interpretation.direction())) {
+      // The scroll was associated with focus before it was delayed. A subsequent cursor move
+      // may already have entered a different document/list; an old scroll must not steal focus
+      // back into the previous subtree. Revalidate against the current saved ancestor identities.
+      if (!FormFactorUtils.isAndroidWear()) {
+        AccessibilityNodeInfoCompat scrolled = AccessibilityEventUtils.sourceCompat(interpretation.event());
+        NodePathDescription currentPath = actorState.getFocusHistory().getLastFocusNodePathDescription();
+        if (currentPath == null || !currentPath.containsNodeByHashAndIdentity(scrolled)) {
+          return;
+        }
+      }
 
       ManualScroll.Builder builder =
           ManualScroll.builder()
